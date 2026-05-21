@@ -512,6 +512,7 @@ class LimitModel {
     entityType: LimitEntityType,
     entityId: string,
     limitType: LimitType = "token_cost",
+    requestModel?: string,
   ): Promise<Limit[]> {
     const limits = await db
       .select()
@@ -524,7 +525,13 @@ class LimitModel {
         ),
       );
 
-    return limits;
+    if (!requestModel) {
+      return limits;
+    }
+
+    return limits.filter(
+      (limit) => !limit.model || limit.model.includes(requestModel),
+    );
   }
 }
 
@@ -541,8 +548,9 @@ export class LimitValidationService {
     agentId: string;
     userId?: string;
     virtualKeyId?: string;
+    requestModel?: string;
   }): Promise<null | [string, string]> {
-    const { agentId, userId, virtualKeyId } = params;
+    const { agentId, userId, virtualKeyId, requestModel } = params;
 
     try {
       logger.info(
@@ -602,6 +610,7 @@ export class LimitValidationService {
         const vkLimitViolation = await LimitValidationService.checkEntityLimits(
           "virtual_key",
           virtualKeyId,
+          requestModel,
         );
         if (vkLimitViolation) {
           logger.info(
@@ -619,7 +628,11 @@ export class LimitValidationService {
           `[LimitValidation] Checking user-level limits for: ${userId}`,
         );
         const userLimitViolation =
-          await LimitValidationService.checkEntityLimits("user", userId);
+          await LimitValidationService.checkEntityLimits(
+            "user",
+            userId,
+            requestModel,
+          );
         if (userLimitViolation) {
           logger.info(
             `[LimitValidation] BLOCKED by user-level limit for: ${userId}`,
@@ -631,6 +644,7 @@ export class LimitValidationService {
             await LimitValidationService.checkDefaultUserLimit({
               organizationId,
               userId,
+              requestModel,
             });
           if (defaultUserLimitViolation) {
             logger.info(
@@ -646,7 +660,11 @@ export class LimitValidationService {
         `[LimitValidation] Checking agent-level limits for: ${agentId}`,
       );
       const agentLimitViolation =
-        await LimitValidationService.checkEntityLimits("agent", agentId);
+        await LimitValidationService.checkEntityLimits(
+          "agent",
+          agentId,
+          requestModel,
+        );
       if (agentLimitViolation) {
         logger.info(
           `[LimitValidation] BLOCKED by agent-level limit for: ${agentId}`,
@@ -673,7 +691,11 @@ export class LimitValidationService {
             `[LimitValidation] Checking team limit for team: ${team.id}`,
           );
           const teamLimitViolation =
-            await LimitValidationService.checkEntityLimits("team", team.id);
+            await LimitValidationService.checkEntityLimits(
+              "team",
+              team.id,
+              requestModel,
+            );
           if (teamLimitViolation) {
             logger.info(
               `[LimitValidation] BLOCKED by team-level limit for team: ${team.id}`,
@@ -694,6 +716,7 @@ export class LimitValidationService {
             await LimitValidationService.checkEntityLimits(
               "organization",
               organizationId,
+              requestModel,
             );
           if (orgLimitViolation) {
             logger.info(
@@ -726,6 +749,7 @@ export class LimitValidationService {
   private static async checkEntityLimits(
     entityType: LimitEntityType,
     entityId: string,
+    requestModel?: string,
   ): Promise<null | [string, string]> {
     try {
       logger.info(
@@ -735,6 +759,7 @@ export class LimitValidationService {
         entityType,
         entityId,
         "token_cost",
+        requestModel,
       );
 
       logger.info(
@@ -766,8 +791,13 @@ export class LimitValidationService {
               .select()
               .from(schema.limitModelUsageTable)
               .where(eq(schema.limitModelUsageTable.limitId, limit.id));
+            const scopedModelUsages = limit.model
+              ? modelUsages.filter((usage) =>
+                  limit.model?.includes(usage.model),
+                )
+              : modelUsages;
 
-            if (modelUsages.length === 0) {
+            if (scopedModelUsages.length === 0) {
               logger.warn(
                 `[LimitValidation] No model usage records found for limit ${limit.id}`,
               );
@@ -775,7 +805,7 @@ export class LimitValidationService {
             } else {
               let totalCost = 0;
 
-              for (const usage of modelUsages) {
+              for (const usage of scopedModelUsages) {
                 // Track total tokens for metadata
                 totalTokensIn += usage.currentUsageTokensIn;
                 totalTokensOut += usage.currentUsageTokensOut;
@@ -810,7 +840,7 @@ export class LimitValidationService {
               limitDescription = "cost_dollars";
 
               logger.debug(
-                `[LimitValidation] Total cost for limit ${limit.id}: $${totalCost.toFixed(2)} across ${modelUsages.length} models`,
+                `[LimitValidation] Total cost for limit ${limit.id}: $${totalCost.toFixed(2)} across ${scopedModelUsages.length} models`,
               );
             }
           } catch (error) {
@@ -886,6 +916,7 @@ ${contentMessage}`;
   private static async checkDefaultUserLimit(params: {
     organizationId: string;
     userId: string;
+    requestModel?: string;
   }): Promise<null | [string, string]> {
     try {
       const [organization] = await db
@@ -909,6 +940,7 @@ ${contentMessage}`;
         "user",
         params.userId,
         "token_cost",
+        params.requestModel,
       );
       if (customUserLimits.length > 0) {
         logger.info(
@@ -922,6 +954,7 @@ ${contentMessage}`;
         userId: params.userId,
         models: normalizeLimitModels(organization.defaultUserLimitModel),
         cleanupInterval: organization.defaultUserLimitCleanupInterval ?? "1w",
+        requestModel: params.requestModel,
       });
 
       if (usage.cost < organization.defaultUserLimitValue) {
@@ -1009,7 +1042,16 @@ async function getDefaultUserLimitUsage(params: {
   userId: string;
   models: string[] | null;
   cleanupInterval: LimitCleanupInterval;
+  requestModel?: string;
 }) {
+  if (
+    params.requestModel &&
+    params.models &&
+    !params.models.includes(params.requestModel)
+  ) {
+    return { cost: 0, tokensIn: 0, tokensOut: 0 };
+  }
+
   const conditions: SQL[] = [
     eq(schema.interactionsTable.userId, params.userId),
     eq(schema.agentsTable.organizationId, params.organizationId),

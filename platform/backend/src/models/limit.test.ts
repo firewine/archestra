@@ -1689,6 +1689,77 @@ describe("LimitValidationService", () => {
       expect(result).not.toBeNull();
       expect(result?.[1]).toContain("organization-level");
     });
+
+    test("ignores model-scoped organization limit for a different request model", async ({
+      makeOrganization,
+      makeAdmin,
+      makeTeam,
+      makeMember,
+      makeAgent,
+    }) => {
+      const org = await makeOrganization();
+      const admin = await makeAdmin();
+      const team = await makeTeam(org.id, admin.id);
+      const agent = await makeAgent({
+        name: "Test Agent",
+        organizationId: org.id,
+      });
+      await makeMember(admin.id, org.id, { role: "admin" });
+
+      await AgentTeamModel.assignTeamsToAgent(agent.id, [team.id]);
+
+      const limit = await LimitModel.create({
+        entityType: "organization",
+        entityId: org.id,
+        limitType: "token_cost",
+        limitValue: 1,
+        model: ["gpt-4o"],
+      });
+
+      await LimitModel.patch(limit.id, { lastCleanup: new Date() });
+      await LimitModel.updateTokenLimitUsage(
+        "organization",
+        org.id,
+        "gpt-4o",
+        1_000_000,
+        1_000_000,
+      );
+
+      const result = await LimitValidationService.checkLimitsBeforeRequest({
+        agentId: agent.id,
+        requestModel: "claude-3-5-sonnet-20241022",
+      });
+
+      expect(result).toBeNull();
+    });
+
+    test("does not count stale usage rows outside the limit model scope", async ({
+      makeAgent,
+    }) => {
+      const agent = await makeAgent({ name: "Test Agent" });
+      const limit = await LimitModel.create({
+        entityType: "agent",
+        entityId: agent.id,
+        limitType: "token_cost",
+        limitValue: 1,
+        model: ["gpt-4o"],
+      });
+
+      await LimitModel.patch(limit.id, { lastCleanup: new Date() });
+      await db.insert(schema.limitModelUsageTable).values({
+        limitId: limit.id,
+        model: "claude-3-5-sonnet-20241022",
+        currentUsageTokensIn: 1_000_000_000,
+        currentUsageTokensOut: 1_000_000_000,
+      });
+
+      const result = await LimitValidationService.checkLimitsBeforeRequest({
+        agentId: agent.id,
+        requestModel: "gpt-4o",
+      });
+
+      expect(result).toBeNull();
+    });
   });
 });
 
